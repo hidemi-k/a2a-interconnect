@@ -1,5 +1,7 @@
 # a2a-interconnect
 
+**[🇯🇵 日本語版はこちら / Japanese version](README.ja.md)**
+
 An A2A (Agent2Agent) implementation of the **Connection Coordinator API** — the open, symmetric OpenAPI 3.0 specification published by AWS/Google to coordinate managed L3 interconnects between cloud providers ([aws/Interconnect](https://github.com/aws/Interconnect)).
 
 **Specification compliance is the primary goal of this project.** The deterministic vendor tools it calls into (see below) are a *means* to that end, not the end itself — they exist so that a negotiated connection is realized on real network equipment without the non-determinism that natural-language-driven configuration otherwise introduces.

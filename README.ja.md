@@ -1,5 +1,7 @@
 # a2a-interconnect
 
+**[🇺🇸 English version here](README.md)**
+
 AWS/Googleが共同で公開しているオープンな対称型OpenAPI 3.0仕様「**Connection Coordinator API**」（クラウドプロバイダ間のL3相互接続を調整する仕様、[aws/Interconnect](https://github.com/aws/Interconnect)）を、A2A（Agent2Agent）プロトコルで実装したものです。
 
 **本プロジェクトの第一目的は、この仕様への準拠そのものです。** 後述する決定論的なベンダー実行ツールは、その目的を達成するための**手段**であり、目的そのものではありません。これは、ネゴシエーションの結果を、自然言語ベースの設定生成が持ち込みがちな非決定性を排除した形で、実際のネットワーク機器に確実に反映させるために存在します。
