@@ -1,62 +1,11 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 hidemi-k
-# License: TBD（a2a-interconnect, 新規プロジェクト）
+# Licensed under the MIT License.
 """
 interconnect_bridge_a2a_server.py — Interconnect Bridge Agent
 ================================================================
 Connection Coordinator API（OpenAPI 3.0 Interconnect）のProvider役を
 A2A化するBridge Agent。同一コードをPROVIDER_ID違いで2プロセス起動する。
-
-【v0.2.0での変更点・概要設計書5.6節/v0.11対応】
-  デプロイ経路を、VENDOR_ID単位で決定論的経路とNL経路に分岐するよう変更。
-    - VENDOR_STRUCTURED_TASK_BUILDERS に登録したベンダー
-      → /deploy_structured（LLM+RAG非経由、決定論的）を使用
-    - 未登録のベンダー（現時点では"junos"含め全ベンダーが未登録。
-      a2a-ceos-coreは凍結のためこのまま、junosはa2a-junos-core側の
-      /deploy_structured実装待ちで意図的に未登録にしてある）
-      → 従来の /execute + /deploy/{trace_id}（NL+RAG+LLM経由）にフォールバック
-  ⚠️ 【実装依存】/deploy_structured は a2a-junos-core 側にまだ実装されて
-  いない（本ファイル更新時点）。エンドポイント契約は
-  _deploy_via_vendor_hub_structured() のdocstringを参照し、実装・実機で
-  の疎通確認が済んでから VENDOR_STRUCTURED_TASK_BUILDERS の該当行を
-  アンコメントすること（手順はその辞書定義部のコメント参照）。
-
-【所属レイヤー】Integration Layer（`a2aポート台帳.md` 3.5-D-3節）
-  ベンダー固有のデバイス操作は行わず、既存のa2a-ceos-core（Vendor Core
-  Layer）に処理を委譲するだけのブリッジであるため、a2a-splunk等と同種の
-  Integration Layerに分類される。
-
-【ポートの考え方（v1.12で訂正）】
-  恒久稼働するのは自分側エンドポイント1つ（8202）のみ。実運用の
-  Connection Coordinator APIは自分自身のエンドポイントを1つ立てれば
-  足り、交渉相手（GCP/Azure等）が何社に増えてもエンドポイント自体は
-  増えない（相手識別はリクエスト内の peer_provider フィールドで行う）。
-
-  ローカル検証時、本物の外部Providerにアクセスできないため、同一コード
-  をもう1プロセス「相手役ダブル」として起動して自作自演することがある。
-  これは台帳に登録された恒久ポートではなく、デモ専用の慣習ポート
-  （8290番台、a2aポート台帳.md 1.1節）を使うこと。
-
-  自分側（恒久）: A2A_PORT=8202 PROVIDER_ID=aws PEER_BASE_URL_GCP=http://localhost:8290
-  相手役ダブル（デモ専用）: A2A_PORT=8290 PROVIDER_ID=gcp PEER_BASE_URL_AWS=http://localhost:8202
-  ※ キーは"自分の役割"ではなく"相手（peer_provider）"の名前である点に注意。
-    PEER_BASE_URL_MAP により、1プロセスで複数のpeer_providerと交渉できる
-    （PEER_BASE_URL単体は非推奨・廃止予定）。
-
-【governance統合方針（重要・a2a-junos-coreとの相違点）】
-  junos_netconf_write_a2a_server.py の governance 統合は
-  「Diff/History タブで人間がすでに承認ボタンを押した」ことを前提に、
-  REVIEW を非ブロックとして扱っている。
-
-  本エージェントが担う自動接続フローには、その人間承認ステップが
-  存在しない（概要設計書 5.3節「自動承認モード」）。したがって
-  REVIEW をそのまま非ブロック実行すると、governance が本来求める
-  人間レビューを経ずに実行されてしまう。
-
-  そのため本エージェントでは、通常のvendor書き込み系とは別の
-  アクション名前空間 "interconnect.autonomous_deploy.*" を用い、
-  REVIEW を「実行継続」ではなく「共用UIでの人間承認待ちに遷移」
-  として扱う（_evaluate_autonomous_deploy() 参照）。
 
 【状態遷移】
   PENDING → GUIDANCE_ISSUED → FEATURE_PROPOSED → FEATURE_ACCEPTED
@@ -83,8 +32,6 @@ A2A化するBridge Agent。同一コードをPROVIDER_ID違いで2プロセス�
   HTTP_TIMEOUT       : 下流呼び出しのタイムアウト秒（デフォルト: 30）
   A2A_PUBLIC_URL     : Agent Cardに載せる公開URL（デフォルト: http://localhost:{A2A_PORT}）
 
-【依存パッケージ】
-  pip install a2a-sdk fastapi uvicorn httpx pydantic --break-system-packages
 """
 
 import asyncio
@@ -123,9 +70,6 @@ from response_schema import (
     STATUS_SUCCESS, STATUS_ERROR,
     make_response, make_error_response, is_ok,
 )
-# ★新規（4.3節「①意図抽出」の実装）: 自然言語からのパラメータ抽出専用。
-#   エコシステム共通の Groq→Azure OpenAI フォールバック構成をそのまま流用する。
-#   プロトコル本体（②以降）は本モジュールでは一切LLMを使わない設計を維持する。
 from llm_factory import build_llm_with_fallback
 
 logging.basicConfig(
@@ -188,6 +132,20 @@ if PEER_BASE_URL and not PEER_BASE_URL_MAP:
         "PEER_BASE_URL は非推奨です。PEER_BASE_URL_{PEER_PROVIDER} 形式の"
         "環境変数（例: PEER_BASE_URL_GCP）を使用してください。"
     )
+
+# ★仕様準拠フェーズA: 本物のInterconnect仕様（feature.yaml の
+#   providerBgpConfigs）は「プロバイダごとに固有の実在ASN」を前提として
+#   おり、動的採番すべき値ではない。PEER_BASE_URL_MAPと同じ環境変数駆動の
+#   パターンで、各providerの実ASNを設定できるようにする。
+#   例: PROVIDER_ASN_AWS=65001 PROVIDER_ASN_GCP=65002
+#   （両方の値を、両プロセスに設定する必要がある。現状はResponder側が
+#   両者のASNをまとめて決めてしまう設計のため。フェーズBで是正予定）。
+_ASN_ENV_PREFIX = "PROVIDER_ASN_"
+PROVIDER_ASN_MAP: Dict[str, int] = {
+    key[len(_ASN_ENV_PREFIX):].lower(): int(value)
+    for key, value in os.environ.items()
+    if key.startswith(_ASN_ENV_PREFIX) and value
+}
 
 
 def _resolve_peer_base_url(peer_provider: str) -> str:
@@ -255,41 +213,95 @@ _connections: Dict[str, Dict[str, Any]] = {}
 
 class L3Allocator:
     """
-    ASN / VLAN / Subnet の採番をデモ用に固定レンジから決定論的に行う。
-
-    本番実装では、Interconnect全体の使用状況を永続ストアで管理して
-    衝突を避ける必要があるが、ハッカソン検討版では単純な連番採番に
-    限定する（設計書 9節「リスクと軽減策」参照）。
+    ASN / VLAN / Subnet の範囲提示（FeatureGuidance）をデモ用に固定レンジから
+    決定論的に行う。
     """
-    _VLAN_BASE = 100  # ★実機検証で判明: a2a-ceos-core の policy_arista.yaml
-                      #   allowed_vlan_ids が 100〜110 のみ許可のため合わせた
-    _ASN_BASE  = 65000
+    _VLAN_BASE = 2000  # ★仕様準拠: 1024以下は予約済みのため、それより十分大きい値に変更
+    _VLAN_RANGE_SIZE = 10       # 1回のFeatureGuidanceで提示するVLAN範囲の幅
     _SUBNET_THIRD_OCTET_BASE = 100  # 169.254.100.0/30, 169.254.101.0/30, ...
+    _MTU_MIN = 1500
+    _MTU_MAX = 9000
 
     def __init__(self):
         self._counter = itertools.count()
 
-    def allocate(self) -> Dict[str, Any]:
+    def generate_guidance(self, provider: str, peer_provider: str) -> Dict[str, Any]:
         """
-        ⚠️ 許可VLAN範囲は100〜110の11個のみ（ceos-core側 policy_arista.yaml
-        allowed_vlan_idsの制約）。単純な連番採番のため、同一プロセスで
-        12回以上ネゴシエーションを行うと範囲外（111〜）になり
-        PolicyChecker BLOCKで失敗する。デモ検証の範囲では問題にならないが、
-        本番相当にする場合は範囲チェック・巻き戻し等の対応が必要。
+        FeatureGuidance（仕様準拠、feature.yaml の L3BaseGuidance相当）を
+        生成する。ここではResponder自身のASN・ホストIPの範囲・VLAN範囲・
+        MTU範囲のみを提示し、Negotiator側が範囲内から実際の値を選択する。
+
+        Args:
+            provider:      自分（Responder）のidentity（"gcp"等）
+            peer_provider: 相手（Negotiator）のidentity（"aws"等）
+
+        Returns:
+            {"vlanRange": {...}, "asnRange": {...}, "ipv4SubnetGuidance": {...},
+             "mtuRange": {...}, "own_asn": int, "peer_asn": int}
+            own_asn/peer_asnはガイダンス自体には含めず、Negotiatorが最終的な
+            providerBgpConfigsを組み立てる際に使う参考情報として別途返す
+            （実在ASNは範囲交渉の対象ではないため）。
         """
         n = next(self._counter)
         third_octet = self._SUBNET_THIRD_OCTET_BASE + n
+        vlan_start = self._VLAN_BASE + n * self._VLAN_RANGE_SIZE
+
+        own_asn = PROVIDER_ASN_MAP.get(provider)
+        peer_asn = PROVIDER_ASN_MAP.get(peer_provider)
+        if own_asn is None:
+            raise ValueError(f"PROVIDER_ASN_MAP に自分（'{provider}'）のASNが未登録です")
+        if peer_asn is None:
+            raise ValueError(f"PROVIDER_ASN_MAP に相手（'{peer_provider}'）のASNが未登録です")
+
         return {
-            "vlanId":     self._VLAN_BASE + n,
-            "asn":        self._ASN_BASE + n,
-            "ipv4Subnet": f"169.254.{third_octet}.0/30",
-            "hostIpv4":   f"169.254.{third_octet}.1",
-            "peerIpv4":   f"169.254.{third_octet}.2",
-            "mtuBytes":   9000,
+            "vlanRange":  {"start": vlan_start, "end": vlan_start + self._VLAN_RANGE_SIZE - 1},
+            "mtuRange":   {"start": self._MTU_MIN, "end": self._MTU_MAX},
+            "ipv4SubnetGuidance": {
+                "includeSubnet": f"169.254.{third_octet}.0/30",
+            },
+            "own_asn":  own_asn,   # Responder自身の実在ASN（範囲ではなく確定値）
+            "peer_asn": peer_asn,  # Negotiator側の実在ASN（Responderが事前に把握している前提）
         }
 
 
+def _select_from_guidance(guidance: Dict[str, Any], provider: str, peer_provider: str) -> Dict[str, Any]:
+    """
+    仕様準拠フェーズB: Negotiator側が、Responderの提示した「範囲」から
+    実際の値を決定論的に選択する。選択戦略は「範囲の最小値を選ぶ」に統一
+    する（設計討議で確認済み）。
+
+    Args:
+        guidance: L3Allocator.generate_guidance() が返した辞書
+        provider: 自分（Negotiator）のidentity
+        peer_provider: 相手（Responder）のidentity
+
+    Returns:
+        仕様のL3BaseConfig（feature.yaml）に準拠した確定済みFeatureConfig。
+    """
+    vlan_id = guidance["vlanRange"]["start"]
+    mtu = guidance["mtuRange"]["start"]
+    include_subnet = guidance["ipv4SubnetGuidance"]["includeSubnet"]
+    network, prefix_len = include_subnet.split("/")
+    third_octet = network.split(".")[2]
+
+    return {
+        "vlanId":                 vlan_id,
+        "ipv4Subnet":             network,
+        "ipv4SubnetPrefixLength": int(prefix_len),
+        "mtuBytes":               mtu,
+        "md5BgpPassword":         uuid.uuid4().hex[:16],
+        "providerBgpConfigs": [
+            # ★ guidanceの own_asn は Responder（=peer_provider視点でのown）を
+            #   指すため、Negotiator視点では「相手のASN」になる。
+            {"provider": provider,      "asn": guidance["peer_asn"], "hostIpv4": f"169.254.{third_octet}.1"},
+            {"provider": peer_provider, "asn": guidance["own_asn"],  "hostIpv4": f"169.254.{third_octet}.2"},
+        ],
+    }
+
+
 _allocator = L3Allocator()
+
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -302,10 +314,30 @@ class CreateConnectionRequest(BaseModel):
     peer_provider: str
 
 
-class ConfirmActivationKeyRequest(BaseModel):
+class AcceptConnectionRequest(BaseModel):
+    """
+    仕様準拠フェーズB（5.13節）: 顧客（エージェント）がResponder側で
+    接続を受け入れる操作。Fabric One流の自然言語入力を想定するが、
+    activation_key等の重要な値はLLM抽出させず構造化パラメータで渡す
+    （create_connection_nlと同じ安全原則）。
+    """
+    text: str = ""  # 自然言語での意思表示（監査ログ用、値の抽出には使わない）
     activation_key: str
     connection_id: str
-    requesting_provider: str
+    negotiator_provider: str  # ActivationKeyを発行した側（Negotiator）のidentity
+
+
+class VerifyActivationKeyRequest(BaseModel):
+    """仕様準拠フェーズB: Responder→NegotiatorへのConfirmActivationKey相当（B→A方向）。"""
+    connection_id: str
+    activation_key: str
+    requesting_provider: str  # 検証を依頼してきた側（Responder）のidentity
+
+
+class GenerateFeatureGuidanceRequest(BaseModel):
+    """仕様準拠フェーズB: Negotiator→ResponderへのGenerateFeatureGuidance要求。"""
+    connection_id: str
+    requesting_provider: str  # 要求元（Negotiator）のidentity
 
 
 class CreateFeatureRequest(BaseModel):
@@ -335,6 +367,25 @@ async def _post(url: str, payload: dict) -> dict:
         return resp.json()
 
 
+def _find_provider_bgp_config(feature_config: Dict[str, Any], provider: str) -> Dict[str, Any]:
+    """
+    仕様準拠フェーズAで導入。providerBgpConfigs配列（feature.yaml準拠）から
+    指定providerのエントリを取り出す共通ヘルパー。
+    """
+    for entry in feature_config.get("providerBgpConfigs", []):
+        if entry.get("provider") == provider:
+            return entry
+    raise KeyError(f"providerBgpConfigsに provider='{provider}' のエントリが見つかりません")
+
+
+def _find_peer_bgp_config(feature_config: Dict[str, Any], own_provider: str) -> Dict[str, Any]:
+    """providerBgpConfigsの中から、自分以外（＝相手）のエントリを取り出す。"""
+    for entry in feature_config.get("providerBgpConfigs", []):
+        if entry.get("provider") != own_provider:
+            return entry
+    raise KeyError(f"providerBgpConfigsに '{own_provider}' 以外のエントリが見つかりません")
+
+
 def _build_write_commands_ceos(feature_config: Dict[str, Any]) -> list[str]:
     """
     Arista cEOS向け自然言語コマンド生成。
@@ -350,15 +401,17 @@ def _build_write_commands_ceos(feature_config: Dict[str, Any]) -> list[str]:
     「L3宣言（dot1qカプセル化等）→IPv4アドレス→MTU」の3ステップに分割
     する案を検証すること（現時点ではまだ2ステップのまま、未検証）。
     """
-    vlan   = feature_config["vlanId"]
-    host_ip = feature_config["hostIpv4"]
-    mtu    = feature_config["mtuBytes"]
-    asn    = feature_config["asn"]
-    peer_ip = feature_config["peerIpv4"]
+    vlan    = feature_config["vlanId"]
+    mtu     = feature_config["mtuBytes"]
+    own_bgp  = _find_provider_bgp_config(feature_config, PROVIDER_ID)
+    peer_bgp = _find_peer_bgp_config(feature_config, PROVIDER_ID)
+    host_ip = own_bgp["hostIpv4"]
+    peer_ip = peer_bgp["hostIpv4"]
+    asn     = peer_bgp["asn"]  # ルータBGPネイバーには相手のASNを指定する
 
     return [
         f"Ethernet1にVLAN {vlan}を作成して、Interconnect-{PROVIDER_ID}という名前を設定して",
-        f"Ethernet1.{vlan}のIPv4アドレスを{host_ip}/30に設定し、MTUを{mtu}にして",
+        f"Ethernet1.{vlan}のIPv4アドレスを{host_ip}/{feature_config['ipv4SubnetPrefixLength']}に設定し、MTUを{mtu}にして",
         f"ルータBGP {asn}にネイバー{peer_ip}を追加して",
     ]
 
@@ -404,17 +457,19 @@ def _build_write_commands_junos(feature_config: Dict[str, Any]) -> list[str]:
     （デフォルト: et-0/0/2、今回の検証トポロジーに合わせた値）。
     """
     vlan    = feature_config["vlanId"]
-    host_ip = feature_config["hostIpv4"]
     mtu     = feature_config["mtuBytes"]
-    asn     = feature_config["asn"]
-    peer_ip = feature_config["peerIpv4"]
+    own_bgp  = _find_provider_bgp_config(feature_config, PROVIDER_ID)
+    peer_bgp = _find_peer_bgp_config(feature_config, PROVIDER_ID)
+    host_ip = own_bgp["hostIpv4"]
+    peer_ip = peer_bgp["hostIpv4"]
+    asn     = peer_bgp["asn"]  # BGPネイバーには相手のASNを指定する
     iface   = JUNOS_IFACE
 
     return [
         f"{iface} のMTUを{mtu}に設定して",
         f"{iface} の802.1Qタグ付けを有効にして",
         f"{iface}のunit {vlan}のvlan-idを{vlan}に設定して",
-        f"{iface}のunit {vlan}にIPv4アドレス{host_ip}/30を設定して",
+        f"{iface}のunit {vlan}にIPv4アドレス{host_ip}/{feature_config['ipv4SubnetPrefixLength']}を設定して",
         f"BGPグループ INTERCONNECT-{PROVIDER_ID} にneighbor {peer_ip}を追加して、AS {asn}を設定して",
     ]
 
@@ -493,9 +548,14 @@ CAPABILITY_REGISTRY: Dict[str, Dict[str, Any]] = {
     "interconnect.l3.ipv4": {
         "task_type":   "interface_ipv4",
         "depends_on":  ["interconnect.l2.vlan_id"],
-        "applies_if":  lambda cfg: "hostIpv4" in cfg and "vlanId" in cfg,
-        "params":      lambda cfg: {"interface": JUNOS_IFACE, "unit": cfg["vlanId"], "ipv4_address": f"{cfg['hostIpv4']}/30"},
-        "description": lambda cfg: f"{JUNOS_IFACE}.{cfg['vlanId']} にIPv4アドレス{cfg['hostIpv4']}/30を設定",
+        "applies_if":  lambda cfg: "providerBgpConfigs" in cfg and "vlanId" in cfg,
+        "params":      lambda cfg: {
+            "interface": JUNOS_IFACE,
+            "unit": cfg["vlanId"],
+            "ipv4_address": f"{_find_provider_bgp_config(cfg, PROVIDER_ID)['hostIpv4']}/{cfg['ipv4SubnetPrefixLength']}",
+        },
+        "description": lambda cfg: f"{JUNOS_IFACE}.{cfg['vlanId']} にIPv4アドレス"
+                                    f"{_find_provider_bgp_config(cfg, PROVIDER_ID)['hostIpv4']}/{cfg['ipv4SubnetPrefixLength']}を設定",
     },
     "interconnect.l3.bgp_neighbor": {
         "task_type":   "bgp_neighbor",
@@ -504,29 +564,80 @@ CAPABILITY_REGISTRY: Dict[str, Dict[str, Any]] = {
         #   そこでは「たまたま最後に書いた」だけで、依存関係として宣言は
         #   されていなかった。ここで明示化する。
         "depends_on":  ["interconnect.l3.ipv4"],
-        "applies_if":  lambda cfg: "peerIpv4" in cfg and "asn" in cfg,
+        "applies_if":  lambda cfg: "providerBgpConfigs" in cfg,
         "params":      lambda cfg: {
             "group": f"INTERCONNECT-{PROVIDER_ID}",
-            "neighbor_ipv4": cfg["peerIpv4"],
-            "peer_as": cfg["asn"],
+            "neighbor_ipv4": _find_peer_bgp_config(cfg, PROVIDER_ID)["hostIpv4"],
+            "peer_as": _find_peer_bgp_config(cfg, PROVIDER_ID)["asn"],
         },
-        "description": lambda cfg: f"BGPグループ INTERCONNECT-{PROVIDER_ID} に neighbor {cfg['peerIpv4']}（AS {cfg['asn']}）を追加",
+        "description": lambda cfg: f"BGPグループ INTERCONNECT-{PROVIDER_ID} に neighbor "
+                                    f"{_find_peer_bgp_config(cfg, PROVIDER_ID)['hostIpv4']}"
+                                    f"（AS {_find_peer_bgp_config(cfg, PROVIDER_ID)['asn']}）を追加",
     },
     # 新しいcapabilityを追加する場合はここに1エントリ足すだけでよい
     # （例: 将来のMACsec鍵ローテーション等、5.8節スコープ外事項の追加時）。
 }
 
+# ── cEOS向けCapability定義（5.15節、実機検証済みの3タスクのみ登録） ──────────
+# ⚠️ interface_mtu は実機検証で発見した課題（openconfig-interfaces:mtuが
+#   `l2 mtu`コマンドに変換されるが、L3ルーテッドモードでは非サポート）が
+#   未解決のため、当面はここに登録しない（5.5節・5.15節参照）。
+CEOS_IFACE = os.getenv("CEOS_IFACE", "Ethernet1")
 
-def _resolve_capability_dag(feature_config: Dict[str, Any]) -> list[Dict[str, Any]]:
+CEOS_CAPABILITY_REGISTRY: Dict[str, Dict[str, Any]] = {
+    "interconnect.l2.vlan": {
+        "task_type":   "create_vlan",
+        "depends_on":  [],
+        "applies_if":  lambda cfg: "vlanId" in cfg,
+        "params":      lambda cfg: {"vlan_id": cfg["vlanId"], "name": f"Interconnect-{PROVIDER_ID}"},
+        "description": lambda cfg: f"VLAN {cfg['vlanId']} を作成し、Interconnect-{PROVIDER_ID}という名前を設定",
+    },
+    "interconnect.l3.ipv4": {
+        "task_type":   "interface_ipv4",
+        "depends_on":  ["interconnect.l2.vlan"],
+        "applies_if":  lambda cfg: "providerBgpConfigs" in cfg and "vlanId" in cfg,
+        "params":      lambda cfg: {
+            "interface": CEOS_IFACE,
+            "unit": cfg["vlanId"],
+            "ip": _find_provider_bgp_config(cfg, PROVIDER_ID)["hostIpv4"],
+            "prefix_length": cfg["ipv4SubnetPrefixLength"],
+        },
+        "description": lambda cfg: f"{CEOS_IFACE}.{cfg['vlanId']} にIPv4アドレス"
+                                    f"{_find_provider_bgp_config(cfg, PROVIDER_ID)['hostIpv4']}を設定",
+    },
+    "interconnect.l3.bgp_neighbor": {
+        "task_type":   "bgp_neighbor",
+        "depends_on":  ["interconnect.l3.ipv4"],
+        "applies_if":  lambda cfg: "providerBgpConfigs" in cfg,
+        "params":      lambda cfg: {
+            "neighbor_ipv4": _find_peer_bgp_config(cfg, PROVIDER_ID)["hostIpv4"],
+            "peer_as": _find_peer_bgp_config(cfg, PROVIDER_ID)["asn"],
+        },
+        "description": lambda cfg: f"BGPネイバー {_find_peer_bgp_config(cfg, PROVIDER_ID)['hostIpv4']}"
+                                    f"（AS {_find_peer_bgp_config(cfg, PROVIDER_ID)['asn']}）を追加",
+    },
+    # interface_mtu は未解決のため未登録（5.5節参照）。解決次第ここに追加する。
+}
+
+
+def _resolve_capability_dag(feature_config: Dict[str, Any], registry: Dict[str, Dict[str, Any]]) -> list[Dict[str, Any]]:
     """
     第1層（Capability判定）→第2層（DAG生成・トポロジカルソート）を実施し、
     第3層（実行）に渡せるタスク列を返す。
+
+    ★汎用化（v0.27、ceos対応）: 従来はグローバル変数CAPABILITY_REGISTRY
+    （Junos専用）を直接参照していたが、cEOS向けにも同じ仕組みを使うため
+    registry引数で切り替えられるようにした。
+
+    Args:
+        feature_config: 仕様のFeatureConfig（providerBgpConfigs配列等）
+        registry: CAPABILITY_REGISTRY または CEOS_CAPABILITY_REGISTRY
 
     Returns:
         [{"task_type": str, "params": dict, "description": str}, ...]
         （既存の _build_structured_tasks_junos() と同じ出力形式）
     """
-    applicable = [name for name, spec in CAPABILITY_REGISTRY.items() if spec["applies_if"](feature_config)]
+    applicable = [name for name, spec in registry.items() if spec["applies_if"](feature_config)]
     applicable_set = set(applicable)
 
     resolved: list[str] = []
@@ -538,10 +649,10 @@ def _resolve_capability_dag(feature_config: Dict[str, Any]) -> list[Dict[str, An
         if name in visiting:
             raise ValueError(f"Capability依存関係に循環を検出: {name}")
         visiting.add(name)
-        for dep in CAPABILITY_REGISTRY[name]["depends_on"]:
+        for dep in registry[name]["depends_on"]:
             if dep in applicable_set:
                 visit(dep)
-            elif dep not in CAPABILITY_REGISTRY:
+            elif dep not in registry:
                 raise ValueError(f"未登録のcapabilityへの依存: {name} → {dep}")
         visiting.discard(name)
         resolved.append(name)
@@ -551,9 +662,9 @@ def _resolve_capability_dag(feature_config: Dict[str, Any]) -> list[Dict[str, An
 
     return [
         {
-            "task_type":   CAPABILITY_REGISTRY[name]["task_type"],
-            "params":      CAPABILITY_REGISTRY[name]["params"](feature_config),
-            "description": CAPABILITY_REGISTRY[name]["description"](feature_config),
+            "task_type":   registry[name]["task_type"],
+            "params":      registry[name]["params"](feature_config),
+            "description": registry[name]["description"](feature_config),
         }
         for name in resolved
     ]
@@ -569,29 +680,35 @@ def _build_structured_tasks_junos(feature_config: Dict[str, Any]) -> list[Dict[s
     実機検証済みの既存順序（MTU→802.1Qタグ付け→vlan-id→IPv4→BGP）と
     導出結果が一致することを確認済み（11.-2節参照）。
     """
-    return _resolve_capability_dag(feature_config)
+    return _resolve_capability_dag(feature_config, CAPABILITY_REGISTRY)
+
+
+def _build_structured_tasks_ceos(feature_config: Dict[str, Any]) -> list[Dict[str, Any]]:
+    """
+    cEOS向け構造化タスク列を生成する（決定論的、LLM不使用）。
+
+    ✅ v0.27で新設。JunosのCAPABILITY_REGISTRY/DAG方式をそのまま流用し、
+    CEOS_CAPABILITY_REGISTRYに差し替えただけ（3層分離パターンがJunos
+    限定でなく再利用可能な設計だったことの実証）。
+    interface_mtuは既知の未解決事項のため対象外（5.5節・5.15節参照）。
+    """
+    return _resolve_capability_dag(feature_config, CEOS_CAPABILITY_REGISTRY)
 
 
 # 決定論的経路（/deploy_structured）が実装済みのベンダーのみここに登録する。
-# 未登録のベンダー（例: 凍結中の a2a-ceos-core）は、_execute_deployment() が
-# 自動的に旧来のNL経路（VENDOR_COMMAND_BUILDERS + _deploy_via_vendor_hub）に
-# フォールバックする。
-#
-# ⚠️ 【実装依存・要確認】a2a-junos-core 側に /deploy_structured がまだ
-#   実装されていない場合、"junos" をここに登録した状態で本エージェントを
-#   動かすと 404 エラーになる。a2a-junos-core 側の実装完了後に登録すること
-#   （概要設計書 5.6節参照。エンドポイント契約は
-#   _deploy_via_vendor_hub_structured() のdocstringに記載）。
+# 未登録のベンダーは、_execute_deployment() が自動的に旧来のNL経路
+# （VENDOR_COMMAND_BUILDERS + _deploy_via_vendor_hub）にフォールバックする。
 VENDOR_STRUCTURED_TASK_BUILDERS: Dict[str, Any] = {
     # ✅ 【有効化済み・①完結で実機確認済み】a2a-junos-core側の/deploy_structured
     #   実装・単体疎通確認・a2a-interconnectからのエンドツーエンド検証
     #   （create_connection→create_feature→approve→VERIFIED到達）を
     #   完了したため有効化した（設計書11.-1節「①完結宣言」参照）。
     "junos": _build_structured_tasks_junos,
-    #
-    # "ceos" は a2a-ceos-core が凍結中のため登録しない（5.8節）。
-    # a2a-ceos-core側に /deploy_structured が実装されない限り、
-    # ceos向けは _build_write_commands_ceos によるNL経路のまま運用する。
+    # ✅ 【有効化済み・v0.27】a2a-ceos-core側の/deploy_structured実装・
+    #   単体疎通確認（create_vlan/interface_ipv4/bgp_neighborの3タスク）を
+    #   完了したため有効化した。interface_mtuは未解決のため対象外
+    #   （CEOS_CAPABILITY_REGISTRYに未登録）。
+    "ceos": _build_structured_tasks_ceos,
 }
 
 
@@ -904,14 +1021,29 @@ async def _execute_deployment(connection_id: str) -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def _do_create_connection(provider: str, environment: str, bandwidth_mbps: int, peer_provider: str) -> dict:
-    """Negotiator側: ActivationKey発行 + 対向へCreateConnectionを転送。"""
+    """
+    Negotiator側: ActivationKeyを発行して顧客（エージェント）に返す。
+
+    ✅ 仕様準拠フェーズB（5.13節）: 従来はここでNegotiatorが自分から対向
+    （Responder）へ`/confirm`を自動送信していたが、これは仕様の
+    「顧客がActivationKeyを持ってResponder側へ行き、AcceptConnectionを
+    呼ぶ」という中間ステップを省略し、かつ呼び出し方向（本来はResponderが
+    Negotiatorへ確認する）も逆転させていた（5.12節で発見した乖離#1）。
+
+    Equinix Fabric One（2026年9月発表）の「natural-language prompts」型
+    入力を参考に、この中間ステップを自然言語エージェント（顧客役）が
+    明示的に担う設計に変更した。本関数はActivationKeyを発行するだけで
+    Responderには一切接続しない。顧客（エージェント）がこのActivationKey
+    を`accept_connection_nl`skillでResponder側に持ち込むことで、初めて
+    ネゴシエーションが先に進む。
+    """
     connection_id = str(uuid.uuid4())
     activation_key = uuid.uuid4().hex
 
     _connections[connection_id] = {
         "connection_id": connection_id,
         "state": "PENDING",
-        "provider": provider,   # ★修正（①完結条件）: 自分自身のidentityも明示的に記録する
+        "provider": provider,
         "environment": environment,
         "bandwidth_mbps": bandwidth_mbps,
         "activation_key": activation_key,
@@ -919,51 +1051,143 @@ async def _do_create_connection(provider: str, environment: str, bandwidth_mbps:
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    peer_url = _resolve_peer_base_url(peer_provider)
-    try:
-        confirm_response = await _post(f"{peer_url}/providers/{peer_provider}/connections/{connection_id}/confirm", {
-            "activation_key": activation_key,
-            "connection_id": connection_id,
-            # ★修正（①完結条件）: グローバル変数 PROVIDER_ID を直接参照せず、
-            #   呼び出し元から渡された provider 引数をそのまま使う。
-            #   これまでは provider 引数を受け取っていながら本文で一切使わず、
-            #   常にグローバル値を参照していたため、引数を渡す意味がなかった
-            #   （将来 PROVIDER_CONFIG_MAP 化する際、この関数はそのまま使い回せる）。
-            "requesting_provider": provider,
-        })
-        # ★修正（①完結に向けて発見）: 従来は/confirmのレスポンスを握りつぶしており、
-        #   Negotiator側は対向が提示したguidanceを一切保持していなかった。
-        #   これが「proposed_configをguidanceと突き合わせ検証できない」問題の
-        #   根本原因の半分だった（もう半分は_do_create_feature側の検証漏れ）。
-        _connections[connection_id]["guidance"] = confirm_response.get("guidance")
-        _connections[connection_id]["state"] = "GUIDANCE_ISSUED"
-    except Exception as e:
-        _connections[connection_id]["state"] = "FAILED"
-        return make_error_response(
-            route="interconnect.create_connection", routed_to=peer_url,
-            message=f"対向への接続要求に失敗: {e}", trace_id=connection_id,
-        )
-
     return make_response(
         status=STATUS_SUCCESS, route="interconnect.create_connection",
-        routed_to=peer_url, summary=f"ActivationKey発行・{peer_provider}へ送信済み",
+        routed_to="", summary=(
+            f"ActivationKeyを発行しました。このキーを持って{peer_provider}側に "
+            f"accept_connection_nl を呼び出してください。"
+        ),
         result=_connections[connection_id], trace_id=connection_id,
     )
 
 
-async def _do_confirm_activation_key(provider: str, connection_id: str, activation_key: str, requesting_provider: str) -> dict:
-    """Responder側: ActivationKeyを受理し、FeatureGuidanceを生成して返す。"""
-    guidance = _allocator.allocate()
+
+async def _do_accept_connection_nl(
+    provider: str, activation_key: str, connection_id: str,
+    negotiator_provider: str, text: str = "",
+) -> dict:
+    """
+    Responder側: 顧客（エージェント）が持ち込んだActivationKeyで接続を
+    受け入れる（仕様のAcceptConnection相当、Fabric One流の自然言語入力）。
+
+    ✅ 仕様準拠フェーズB（5.13節）:
+    従来は`_do_confirm_activation_key`が「Negotiatorからの直接送信を
+    無条件で信頼する」実装になっており、Bが独立してAに真正性を確認する
+    手続きが存在しなかった。ここでは、まずローカルに仮登録した上で、
+    Negotiator(A)へ`verify_activation_key`を呼んで検証し（B→A方向、
+    仕様通り）、検証OKなら続けてAへ`GenerateFeatureGuidance`を要求する
+    …のではなく、仕様のNegotiator主導の設計（Negotiatorがguidanceを
+    要求する）に合わせ、検証OK後はAからのgenerate_feature_guidance
+    呼び出しを待つ形にする（本関数ではAへの検証依頼のみ行う）。
+    """
+    peer_url = _resolve_peer_base_url(negotiator_provider)
+
     _connections[connection_id] = {
         "connection_id": connection_id,
-        "state": "GUIDANCE_ISSUED",
-        "provider": provider,   # ★修正（①完結条件）: Negotiator側と同様、自分自身のidentityを記録
+        "state": "PENDING_VERIFY",
+        "provider": provider,
         "activation_key": activation_key,
-        "peer_provider": requesting_provider,
-        "guidance": guidance,
+        "peer_provider": negotiator_provider,
+        "accept_text": text,
     }
-    logger.info(f"[{connection_id}] ActivationKey確認・FeatureGuidance生成: {guidance}")
-    return {"connection_id": connection_id, "guidance": guidance}
+
+    try:
+        verify_response = await _post(
+            f"{peer_url}/providers/{negotiator_provider}/connections/{connection_id}/verify_activation_key",
+            {
+                "connection_id": connection_id,
+                "activation_key": activation_key,
+                "requesting_provider": provider,
+            },
+        )
+    except Exception as e:
+        _connections[connection_id]["state"] = "FAILED"
+        return make_error_response(
+            route="interconnect.accept_connection_nl", routed_to=peer_url,
+            message=f"Negotiatorへの検証依頼に失敗: {e}", trace_id=connection_id,
+        )
+
+    if not verify_response.get("valid"):
+        _connections[connection_id]["state"] = "FAILED"
+        return make_error_response(
+            route="interconnect.accept_connection_nl", routed_to=peer_url,
+            message="ActivationKeyの検証に失敗しました（Negotiator側が無効と判定）",
+            trace_id=connection_id,
+        )
+
+    _connections[connection_id]["state"] = "CONFIRMED"
+    logger.info(f"[{connection_id}] ActivationKey検証成功。Negotiatorからのguidance要求待ち。")
+    return make_response(
+        status=STATUS_SUCCESS, route="interconnect.accept_connection_nl",
+        routed_to=peer_url, summary="ActivationKeyを検証しました。Negotiatorからのguidance要求を待機します。",
+        result=_connections[connection_id], trace_id=connection_id,
+    )
+
+
+async def _do_verify_activation_key(provider: str, connection_id: str, activation_key: str, requesting_provider: str) -> dict:
+    """
+    Negotiator側: Responderからの検証依頼を受ける（仕様のConfirmActivationKey相当、
+    B→A方向）。検証成功後、自らResponderへGenerateFeatureGuidanceを要求し、
+    範囲から値を選択してCreateFeatureへ進む一連の処理を非同期で開始する。
+    """
+    conn = _connections.get(connection_id)
+    if conn is None:
+        return {"valid": False, "reason": f"connection_id '{connection_id}' が見つかりません"}
+    if conn.get("activation_key") != activation_key:
+        return {"valid": False, "reason": "activation_keyが一致しません"}
+    if conn.get("peer_provider") != requesting_provider:
+        return {"valid": False, "reason": f"想定していた相手（'{conn.get('peer_provider')}'）と異なります"}
+
+    conn["state"] = "CONFIRMED"
+    logger.info(f"[{connection_id}] Responder（{requesting_provider}）からの検証依頼を確認、guidance要求フローを開始")
+    asyncio.create_task(_negotiate_after_confirm(connection_id))
+    return {"valid": True}
+
+
+async def _negotiate_after_confirm(connection_id: str) -> None:
+    """
+    Negotiator側: 検証成功後、Responderへguidanceを要求→範囲内から値を選択→
+    CreateFeatureへ進む一連の流れをバックグラウンドで実行する。
+    """
+    conn = _connections[connection_id]
+    provider = conn["provider"]
+    peer_provider = conn["peer_provider"]
+    peer_url = _resolve_peer_base_url(peer_provider)
+
+    try:
+        guidance = await _post(
+            f"{peer_url}/providers/{peer_provider}/connections/{connection_id}/generate_feature_guidance",
+            {"connection_id": connection_id, "requesting_provider": provider},
+        )
+        conn["guidance"] = guidance
+        conn["state"] = "GUIDANCE_ISSUED"
+
+        proposed_config = _select_from_guidance(guidance, provider, peer_provider)
+        logger.info(f"[{connection_id}] guidanceから値を選択: {proposed_config}")
+
+        await _do_create_feature(provider, connection_id, proposed_config, propagate=True)
+    except Exception as e:
+        conn["state"] = "FAILED"
+        conn["error"] = f"guidance要求〜Feature提案の途中で失敗: {e}"
+        logger.error(f"[{connection_id}] {conn['error']}")
+
+
+async def _do_generate_feature_guidance(provider: str, connection_id: str, requesting_provider: str) -> dict:
+    """
+    Responder側: Negotiatorからのguidance要求を受け、範囲（FeatureGuidance）を
+    生成して返す（仕様のGenerateFeatureGuidance相当）。
+    """
+    conn = _connections.get(connection_id)
+    if conn is None:
+        raise KeyError(f"connection_id '{connection_id}' が見つかりません")
+    if conn.get("peer_provider") != requesting_provider:
+        raise ValueError(f"想定していた相手（'{conn.get('peer_provider')}'）と異なるリクエストです")
+
+    guidance = _allocator.generate_guidance(provider, requesting_provider)
+    conn["guidance"] = guidance
+    conn["state"] = "GUIDANCE_ISSUED"
+    logger.info(f"[{connection_id}] FeatureGuidance生成: {guidance}")
+    return guidance
 
 
 async def _do_create_feature(provider: str, connection_id: str, proposed_config: Dict[str, Any], propagate: bool = True) -> dict:
@@ -990,7 +1214,12 @@ async def _do_create_feature(provider: str, connection_id: str, proposed_config:
 
     conn = _connections[connection_id]
     guidance = conn.get("guidance")
-    if guidance:
+    if guidance and "vlanRange" not in guidance:
+        # ★仕様準拠フェーズB以前のguidance形式（確定値）が残っていた場合の
+        #   後方互換チェック。新形式（範囲、vlanRangeキーを持つ）の場合は
+        #   _select_from_guidance() が既に範囲内に収まる値しか生成しない
+        #   ため、ここでの一致比較は行わない（範囲 vs 確定値は構造が
+        #   異なり単純比較できないため）。
         mismatched = {
             k: (guidance[k], proposed_config.get(k))
             for k in guidance
@@ -1005,6 +1234,26 @@ async def _do_create_feature(provider: str, connection_id: str, proposed_config:
                         "guidanceで提示された値をそのまま使用してください。",
                 trace_id=connection_id,
             )
+    elif guidance:
+        # ★新形式（範囲）の場合の検証: 提案値が範囲内に収まっているかを確認する。
+        vlan_range = guidance.get("vlanRange", {})
+        if "vlanId" in proposed_config and vlan_range:
+            if not (vlan_range["start"] <= proposed_config["vlanId"] <= vlan_range["end"]):
+                return make_error_response(
+                    route="interconnect.create_feature", routed_to="",
+                    message=f"proposed_configのvlanId（{proposed_config['vlanId']}）が"
+                            f"guidanceの範囲（{vlan_range['start']}〜{vlan_range['end']}）外です。",
+                    trace_id=connection_id,
+                )
+        mtu_range = guidance.get("mtuRange", {})
+        if "mtuBytes" in proposed_config and mtu_range:
+            if not (mtu_range["start"] <= proposed_config["mtuBytes"] <= mtu_range["end"]):
+                return make_error_response(
+                    route="interconnect.create_feature", routed_to="",
+                    message=f"proposed_configのmtuBytes（{proposed_config['mtuBytes']}）が"
+                            f"guidanceの範囲（{mtu_range['start']}〜{mtu_range['end']}）外です。",
+                    trace_id=connection_id,
+                )
 
     conn["feature_config"] = proposed_config
     conn["state"] = "FEATURE_ACCEPTED"
@@ -1088,9 +1337,26 @@ async def create_connection(provider: str, req: CreateConnectionRequest):
     return await _do_create_connection(provider, req.environment, req.bandwidth_mbps, req.peer_provider)
 
 
-@app.post(f"/providers/{{provider}}/connections/{{connection_id}}/confirm")
-async def confirm_activation_key(provider: str, connection_id: str, req: ConfirmActivationKeyRequest):
-    return await _do_confirm_activation_key(provider, connection_id, req.activation_key, req.requesting_provider)
+@app.post(f"/providers/{{provider}}/connections/{{connection_id}}/accept_connection_nl")
+async def accept_connection_nl(provider: str, connection_id: str, req: AcceptConnectionRequest):
+    return await _do_accept_connection_nl(
+        provider, req.activation_key, connection_id, req.negotiator_provider, req.text,
+    )
+
+
+@app.post(f"/providers/{{provider}}/connections/{{connection_id}}/verify_activation_key")
+async def verify_activation_key(provider: str, connection_id: str, req: VerifyActivationKeyRequest):
+    return await _do_verify_activation_key(provider, connection_id, req.activation_key, req.requesting_provider)
+
+
+@app.post(f"/providers/{{provider}}/connections/{{connection_id}}/generate_feature_guidance")
+async def generate_feature_guidance(provider: str, connection_id: str, req: GenerateFeatureGuidanceRequest):
+    try:
+        return await _do_generate_feature_guidance(provider, connection_id, req.requesting_provider)
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(409, str(e))
 
 
 @app.post(f"/providers/{{provider}}/connections/{{connection_id}}/features")
@@ -1229,8 +1495,13 @@ _SKILL_DISPATCH = {
         p.get("provider", PROVIDER_ID), p["environment"], p["bandwidth_mbps"], p["peer_provider"]),
     "create_connection_nl":     lambda p: _do_create_connection_nl(
         p.get("provider", PROVIDER_ID), p["text"]),
-    "confirm_activation_key":   lambda p: _do_confirm_activation_key(
+    "accept_connection_nl":     lambda p: _do_accept_connection_nl(
+        p.get("provider", PROVIDER_ID), p["activation_key"], p["connection_id"],
+        p["negotiator_provider"], p.get("text", "")),
+    "verify_activation_key":    lambda p: _do_verify_activation_key(
         p.get("provider", PROVIDER_ID), p["connection_id"], p["activation_key"], p["requesting_provider"]),
+    "generate_feature_guidance": lambda p: _do_generate_feature_guidance(
+        p.get("provider", PROVIDER_ID), p["connection_id"], p["requesting_provider"]),
     "create_feature":           lambda p: _do_create_feature(
         p.get("provider", PROVIDER_ID), p["connection_id"], p["proposed_config"], p.get("propagate", True)),
     "notify_connection_status": lambda p: _do_notify_connection_status(
@@ -1308,9 +1579,33 @@ def _build_agent_card() -> AgentCard:
             examples=['{"skill":"create_connection_nl","text":"AWSのus-east-1とGCPの間に1Gbpsの接続を作って"}'],
         ),
         AgentSkill(
-            id="confirm_activation_key",
-            name="ConfirmActivationKey",
-            description="相手から受けたActivationKeyの真正性を確認し、FeatureGuidanceを生成する（Responder側）。",
+            id="accept_connection_nl",
+            name="AcceptConnectionFromNaturalLanguage",
+            description=(
+                "顧客（エージェント）がActivationKeyを持ち込み、Responder側で接続を受け入れる"
+                "（仕様のAcceptConnection相当、Fabric One流の自然言語入力）。"
+                "activation_key等の重要な値はLLM抽出させず構造化パラメータで受け取る。"
+            ),
+            tags=["interconnect", "negotiation", "nl"],
+            examples=['{"skill":"accept_connection_nl","text":"GCP側で接続を受け入れて","activation_key":"...","connection_id":"...","negotiator_provider":"aws"}'],
+        ),
+        AgentSkill(
+            id="verify_activation_key",
+            name="VerifyActivationKey",
+            description=(
+                "Responderからの検証依頼を受け、ActivationKeyの真正性を確認する"
+                "（仕様のConfirmActivationKey相当、B→A方向）。検証成功後、"
+                "自らGenerateFeatureGuidanceを要求する一連の処理を開始する。"
+            ),
+            tags=["interconnect", "negotiation"],
+        ),
+        AgentSkill(
+            id="generate_feature_guidance",
+            name="GenerateFeatureGuidance",
+            description=(
+                "Negotiatorからのguidance要求を受け、VLAN/ASN/Subnet/MTUの範囲"
+                "（FeatureGuidance）を生成して返す（仕様準拠、確定値ではなく範囲）。"
+            ),
             tags=["interconnect", "negotiation"],
         ),
         AgentSkill(
